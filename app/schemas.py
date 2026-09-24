@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, FiniteFloat, field_validator
 
 from .utils import SUPPORTED_ALGS, compute_digest, fmt
 
@@ -160,6 +160,50 @@ class CommonTraceIn(BaseModel):
             dup = sorted({c for c in codes if codes.count(c) > 1})
             raise ValueError(f"仪器编码不得重复: {dup}")
         return codes
+
+
+class MeasurementReadingIn(BaseModel):
+    """一条参与相容性评估的读数：仪器编码 + 有限测量值。"""
+
+    instrument_code: str = Field(..., min_length=1, description="仪器编码")
+    value: FiniteFloat = Field(
+        ..., description="测量值（须为有限浮点数，拒绝 NaN/Inf）"
+    )
+
+
+class MeasurementCompatibilityIn(BaseModel):
+    """测量相容性评估请求（只读，不写入数据库）。"""
+
+    at: Optional[datetime] = Field(
+        None, description="UTC 查询时点；留空取服务端当前时间"
+    )
+    target_unit: str = Field(
+        ..., description="目标单位；与各仪器起点证书的不确定度单位精确比对"
+    )
+    readings: List[MeasurementReadingIn] = Field(
+        ...,
+        min_length=2,
+        max_length=12,
+        description="2～12 条读数；仪器编码互不相同，测量值须为有限浮点数",
+    )
+
+    @field_validator("target_unit")
+    @classmethod
+    def _strip_target_unit(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("readings")
+    @classmethod
+    def _check_readings(cls, v: List[MeasurementReadingIn]):
+        codes = [r.instrument_code.strip() for r in v]
+        if any(not c for c in codes):
+            raise ValueError("仪器编码不能为空字符串")
+        if len(set(codes)) != len(codes):
+            dup = sorted({c for c in codes if codes.count(c) > 1})
+            raise ValueError(f"仪器编码不得重复: {dup}")
+        for r, c in zip(v, codes):
+            r.instrument_code = c
+        return v
 
 
 # ---------- 输出 ----------
@@ -574,6 +618,144 @@ class CommonTraceReport(BaseModel):
         default_factory=list,
         description="逐台仪器的参与结果：子链、距离或不可参与原因",
     )
+    statistics: dict = Field(default_factory=dict)
+
+
+# ---------- 测量相容性评估输出 ----------
+
+class MeasurementReadingResult(BaseModel):
+    """单条读数的评估结果：参与则给出所用不确定度，否则给出不可参与原因。"""
+
+    instrument: str
+    value: float
+    participated: bool = Field(
+        ..., description="该读数是否以唯一且校验通过的链参与了 En 计算"
+    )
+    start_certificate_id: Optional[str] = Field(
+        None, description="该仪器在查询时点的唯一有效链起点证书 id"
+    )
+    certificate_unit: Optional[str] = Field(
+        None, description="起点证书的不确定度单位"
+    )
+    uncertainty: Optional[float] = Field(
+        None, description="参与计算时使用的起点证书扩展不确定度 U"
+    )
+    nonparticipation_reason_code: Optional[str] = None
+    nonparticipation_reason: Optional[str] = None
+
+
+class MeasurementNonparticipant(BaseModel):
+    """一条不可参与计算的读数及其原因（附该时点链路报告证据）。"""
+
+    instrument: str
+    value: float
+    reason_code: str = Field(
+        ...,
+        description=(
+            "不可参与原因码：INSTRUMENT_NOT_FOUND | NO_ACTIVE_CERTIFICATE | "
+            "MULTIPLE_ACTIVE_CERTIFICATES | MULTIPLE_VALID_CHAINS | "
+            "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED | "
+            "CERTIFICATE_UNIT_MISMATCH"
+        ),
+    )
+    reason: str = Field(..., description="中文原因说明")
+    resolution: Optional[str] = Field(
+        None, description="该时点单仪器报告的 resolution（仪器不存在时为 null）"
+    )
+    valid: bool
+    starts: List[str] = Field(
+        default_factory=list, description="该时点有效的起点证书 id"
+    )
+    conflicts: List[Conflict] = Field(
+        default_factory=list,
+        description="该时点单仪器报告的完整可解释冲突明细（结构同 /api/reports）",
+    )
+    start_certificate_id: Optional[str] = Field(
+        None, description="链可用但单位不符时给出起点证书 id，否则为 null"
+    )
+    certificate_unit: Optional[str] = Field(
+        None, description="链可用但单位不符时给出起点证书单位，否则为 null"
+    )
+    error_count: Optional[int] = None
+    warning_count: Optional[int] = None
+
+
+class CompatibilityPair(BaseModel):
+    """一对可参与读数的 En 数计算与相容判定。"""
+
+    instrument_a: str
+    instrument_b: str
+    value_a: float
+    value_b: float
+    uncertainty_a: float
+    uncertainty_b: float
+    difference: float = Field(..., description="两读数之差绝对值 |x_a - x_b|")
+    en: Optional[float] = Field(
+        None,
+        description=(
+            "En=|x_a-x_b|/sqrt(U_a^2+U_b^2)；两个不确定度均为 0 时无定义（null）"
+        ),
+    )
+    compatible: bool = Field(
+        ..., description="En<=1 判为相容；两 U 均为 0 时仅读数相等才相容"
+    )
+    rule: str = Field(
+        ...,
+        description=(
+            "判定规则：en_le_1（按 En 数判定）| "
+            "zero_uncertainty_equality（两 U 均为 0，按读数是否相等判定）"
+        ),
+    )
+
+
+class CompatibilityGroup(BaseModel):
+    """一个极大两两相容分组（极大团，人数 ≥ 2，组间可重叠）。"""
+
+    members: List[str] = Field(
+        ..., description="组内仪器编码，按字典序排列"
+    )
+    size: int = Field(..., description="组内仪器数量（≥2）")
+
+
+class MeasurementCompatibilityReport(BaseModel):
+    at: datetime
+    dry_run: bool = Field(
+        ..., description="恒为 true：相容性评估为只读计算，不写入业务数据"
+    )
+    target_unit: str = Field(..., description="参与比对的目标单位（已去空白）")
+    reading_count: int
+    participant_count: int
+    nonparticipant_count: int
+    participants: List[str] = Field(
+        default_factory=list,
+        description="实际参与 En 计算的仪器编码（按请求顺序）",
+    )
+    nonparticipants: List[MeasurementNonparticipant] = Field(
+        default_factory=list,
+        description="逐条给出的不可参与读数及原因（多候选链不任取一条）",
+    )
+    readings: List[MeasurementReadingResult] = Field(
+        default_factory=list,
+        description="逐条读数的评估结果（按请求顺序）",
+    )
+    pairs: List[CompatibilityPair] = Field(
+        default_factory=list,
+        description="可参与读数的两两 En 计算与判定（按仪器编码排序）",
+    )
+    groups: List[CompatibilityGroup] = Field(
+        default_factory=list,
+        description=(
+            "全部人数 ≥2 的极大两两相容分组（极大团，可重叠，"
+            "按仪器编码稳定排序，不以连通分量代替）"
+        ),
+    )
+    reason_code: Optional[str] = Field(
+        None,
+        description=(
+            "可参与读数不足 2 条时为 INSUFFICIENT_PARTICIPANTS；否则为 null"
+        ),
+    )
+    reason: Optional[str] = Field(None, description="中文原因说明")
     statistics: dict = Field(default_factory=dict)
 
 

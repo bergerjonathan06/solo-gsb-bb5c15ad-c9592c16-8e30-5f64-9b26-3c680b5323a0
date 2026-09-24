@@ -1,11 +1,16 @@
 """计量校准溯源 API 入口。"""
 from __future__ import annotations
 
+import math
 import os
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .database import get_conn_ctx, init_db
 from .routers import (
@@ -49,6 +54,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _sanitize_non_finite(obj: Any) -> Any:
+    """把错误详情中的非有限浮点（NaN/±Inf）替换为字符串。
+
+    请求体含 NaN/Infinity 时，校验错误的 ``input`` 字段会携带这些值，
+    而 JSON 响应不允许序列化非有限浮点（``allow_nan=False``），
+    不处理会把本应返回 422 的请求变成 500。
+    """
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_non_finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_non_finite(v) for v in obj]
+    return obj
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """与 FastAPI 默认处理器一致返回 422，但先清洗非有限浮点。"""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": jsonable_encoder(_sanitize_non_finite(exc.errors()))
+        },
+    )
+
 app.include_router(instruments.router)
 app.include_router(certificates.router)
 app.include_router(edges.router)
@@ -83,6 +117,10 @@ def root():
             "batch_common_traceability": (
                 "POST /api/assessments/common-traceability"
                 "（多仪器共同溯源核查，只读，不写库）"
+            ),
+            "measurement_compatibility": (
+                "POST /api/assessments/measurement-compatibility"
+                "（多仪器读数 En 数相容性评估，只读，不写库）"
             ),
             "calibration_slot_query": (
                 "GET /api/calibration-slots?instrument=&start=&end=&duration_seconds="

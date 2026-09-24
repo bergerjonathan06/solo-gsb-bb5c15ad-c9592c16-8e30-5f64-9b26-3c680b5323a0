@@ -9,6 +9,7 @@ from ..database import get_db
 from ..engine import (
     assess_deactivation,
     build_common_trace_report,
+    build_measurement_compatibility_report,
     build_report,
     build_window_report,
 )
@@ -18,6 +19,8 @@ from ..schemas import (
     CoverageWindowReport,
     DeactivationImpactReport,
     DeactivationIn,
+    MeasurementCompatibilityIn,
+    MeasurementCompatibilityReport,
     TraceReport,
 )
 
@@ -138,3 +141,32 @@ def common_traceability(body: CommonTraceIn, db: Connection = Depends(get_db)):
     返回“无共同证书”。整个过程只读数据库，响应恒带 ``dry_run: true``。
     """
     return build_common_trace_report(db, body.at, body.instrument_codes)
+
+
+@router.post(
+    "/assessments/measurement-compatibility",
+    response_model=MeasurementCompatibilityReport,
+    tags=["measurement-compatibility"],
+)
+def measurement_compatibility(
+    body: MeasurementCompatibilityIn, db: Connection = Depends(get_db)
+):
+    """测量相容性评估（En 数，只读，不写入业务数据）。
+
+    输入 UTC 时点、目标单位与 2～12 条**互异**仪器编码及有限测量值。
+    服务端逐条**复用现有单仪器链路报告**：仅以该时点**唯一且校验通过**
+    （resolution=unique 且零 ERROR）的溯源链参与，取其**起点证书**的扩展
+    不确定度作为该读数的 U；链不可用（多候选链绝不任取一条）或起点证书
+    单位与目标单位不符的读数逐条返回原因、不参与计算。
+
+    对可参与读数两两计算 En=|x_i-x_j|/sqrt(U_i²+U_j²)，En≤1 判为相容；
+    两个不确定度均为 0 时 En 无定义（响应中为 null），仅读数相等才相容。
+    返回每对 En 与判定，以及全部人数 ≥2 的**极大两两相容分组**（极大团，
+    分组可重叠，按仪器编码稳定排序，不以连通分量代替）。
+    """
+    return build_measurement_compatibility_report(
+        db,
+        body.at,
+        body.target_unit,
+        [(r.instrument_code, r.value) for r in body.readings],
+    )
