@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -767,7 +768,7 @@ def _nonparticipation(
             REASON_MULTIPLE_VALID_CHAINS,
             f"仪器 {code} 在查询时点 {at_s} 存在 "
             f"{report['statistics'].get('valid_root_chains', 0)} 条均到达国家基准且"
-            "通过校验的候选链，链不唯一，不得任意选取一条参与共同核查",
+            "通过校验的候选链，链不唯一，不得任意选取一条参与批次评估",
         )
     if report["resolution"] == "broken":
         if report["statistics"].get("root_reaching_chains", 0) > 0:
@@ -1297,6 +1298,318 @@ def assess_deactivation(
             "certificates_after": len(simulated.certs),
             "edges_before": len(base.edges),
             "edges_after": len(simulated.edges),
+        },
+    }
+
+
+# ---------------------------------------------------------------- 批次测量值相容性评估
+
+# 不可参与读数的附加原因码
+REASON_CERTIFICATE_UNIT_MISMATCH = "CERTIFICATE_UNIT_MISMATCH"
+REASON_INSUFFICIENT_COMPATIBLE_READINGS = "INSUFFICIENT_PARTICIPANTS"
+
+# En 判定边界：En<=1 判为相容，给浮点误差留一个极小容差
+_EN_THRESHOLD = 1.0 + UNCERTAINTY_EPS
+
+_DECISION_COMPATIBLE = "COMPATIBLE"
+_DECISION_INCOMPATIBLE = "INCOMPATIBLE"
+_DECISION_ZERO_EQUAL = "BOTH_UNCERTAINTY_ZERO_EQUAL"
+_DECISION_ZERO_UNEQUAL = "BOTH_UNCERTAINTY_ZERO_UNEQUAL"
+
+
+def maximal_cliques(adj: dict[str, set[str]]) -> list[tuple[str, ...]]:
+    """枚举无向图全部极大团（Bron–Kerbosch，pivot 剪枝）。
+
+    ``adj`` 为节点 -> 相邻节点集合。返回按节点元组字典序稳定排序的
+    极大团列表，每个团内节点同样字典序升序。相容性评估图节点数
+    （2～12）有界，朴素实现即可满足性能要求。
+    """
+    result: list[tuple[str, ...]] = []
+    nodes = sorted(adj)
+
+    def bron_kerbosch(r: set[str], p: set[str], x: set[str]) -> None:
+        if not p and not x:
+            if r:  # 空图只产生空团，相容性分组至少需要成员，直接丢弃
+                result.append(tuple(sorted(r)))
+            return
+        # pivot：取 P∪X 中邻居最多的节点，强制每个最大团要么含 pivot、
+        # 要么含某个 pivot 非邻居节点，减少等价递归分支
+        pivot = max(p | x, key=lambda u: len(adj[u] & p))
+        candidates = list(p - adj[pivot])
+        for v in sorted(candidates):
+            bron_kerbosch(r | {v}, p & adj[v], x & adj[v])
+            p = p - {v}
+            x = x | {v}
+
+    bron_kerbosch(set(), set(nodes), set())
+    result.sort()
+    return result
+
+
+def build_measurement_compatibility_report(
+    conn: sqlite3.Connection,
+    at: Optional[datetime],
+    target_unit: str,
+    readings: list[tuple[str, float]],
+) -> dict[str, Any]:
+    """批次测量值相容性评估：对可参与读数两两计算 En 并枚举极大相容分组。
+
+    复用现有单仪器链路报告（``_build_report``）：仅当仪器在评估时点的
+    报告为唯一成链且零 ERROR 时可参与，并额外要求其**起点证书登记的
+    不确定度单位与目标单位一致**；链不可用或单位不符的读数逐条返回
+    原因，不参与计算（多候选链绝不任取一条）。
+
+    对可参与读数两两计算
+    ``En = |x_i - x_j| / sqrt(U_i^2 + U_j^2)``（U 取各仪器唯一有效链
+    起点证书的扩展不确定度）：``En <= 1`` 判为相容；两 U 均为 0 时分母
+    为零，仅当测量值相等才相容。全部“人数至少为 2”的**极大两两相容
+    分组**（极大团，分组可重叠、不得用连通分量代替）按仪器编码稳定
+    排序返回。全程只读，不写入数据。
+    """
+    at_naive = to_utc_naive(at) if at else datetime.utcnow()
+    at_s = fmt(at_naive)
+    target_unit = target_unit.strip()
+
+    cat = Catalog(conn)
+
+    nonparticipants: list[dict[str, Any]] = []
+    reading_results: list[dict[str, Any]] = []
+    participants: dict[str, dict[str, Any]] = {}
+
+    for code, value in readings:
+        if code not in cat.instruments:
+            nonparticipants.append(
+                {
+                    "instrument": code,
+                    "value": value,
+                    "reason_code": REASON_INSTRUMENT_NOT_FOUND,
+                    "reason": f"仪器 {code} 不存在，无法参与测量值相容性评估",
+                    "resolution": None,
+                    "valid": False,
+                    "start_certificate_id": None,
+                    "certificate_unit": None,
+                    "uncertainty": None,
+                    "conflicts": [],
+                    "error_count": None,
+                    "warning_count": None,
+                }
+            )
+            reading_results.append(
+                {
+                    "instrument": code,
+                    "value": value,
+                    "participated": False,
+                    "start_certificate_id": None,
+                    "uncertainty": None,
+                    "unit": None,
+                    "nonparticipation_reason_code": REASON_INSTRUMENT_NOT_FOUND,
+                    "nonparticipation_reason":
+                        f"仪器 {code} 不存在，无法参与测量值相容性评估",
+                }
+            )
+            continue
+
+        report = _build_report(cat, code, at_s)
+        rejection = _nonparticipation(code, report, at_s)
+        if rejection is not None:
+            reason_code, reason = rejection
+            np_row = {
+                "instrument": code,
+                "value": value,
+                "reason_code": reason_code,
+                "reason": reason,
+                "resolution": report["resolution"],
+                "valid": report["valid"],
+                "start_certificate_id": None,
+                "certificate_unit": None,
+                "uncertainty": None,
+                "conflicts": report["conflicts"],
+                "error_count": report["error_count"],
+                "warning_count": report["warning_count"],
+            }
+            nonparticipants.append(np_row)
+            reading_results.append(
+                {
+                    "instrument": code,
+                    "value": value,
+                    "participated": False,
+                    "start_certificate_id": None,
+                    "uncertainty": None,
+                    "unit": None,
+                    "nonparticipation_reason_code": reason_code,
+                    "nonparticipation_reason": reason,
+                }
+            )
+            continue
+
+        start_node = report["active_chain"]["nodes"][0]
+        start_cert_id = start_node["certificate_id"]
+        cert_unit = start_node["unit"].strip()
+        cert_u = float(start_node["uncertainty"])
+        if cert_unit != target_unit:
+            reason = (
+                f"仪器 {code} 在时点 {at_s} 的唯一有效链起点证书 {start_cert_id}"
+                f" 登记的不确定度单位为 '{cert_unit}'，与目标单位 "
+                f"'{target_unit}' 不一致，不做单位换算，该读数不参与相容性计算"
+            )
+            nonparticipants.append(
+                {
+                    "instrument": code,
+                    "value": value,
+                    "reason_code": REASON_CERTIFICATE_UNIT_MISMATCH,
+                    "reason": reason,
+                    "resolution": report["resolution"],
+                    "valid": report["valid"],
+                    "start_certificate_id": start_cert_id,
+                    "certificate_unit": cert_unit,
+                    "uncertainty": cert_u,
+                    "conflicts": report["conflicts"],
+                    "error_count": report["error_count"],
+                    "warning_count": report["warning_count"],
+                }
+            )
+            reading_results.append(
+                {
+                    "instrument": code,
+                    "value": value,
+                    "participated": False,
+                    "start_certificate_id": start_cert_id,
+                    "uncertainty": cert_u,
+                    "unit": cert_unit,
+                    "nonparticipation_reason_code":
+                        REASON_CERTIFICATE_UNIT_MISMATCH,
+                    "nonparticipation_reason": reason,
+                }
+            )
+            continue
+
+        participants[code] = {
+            "value": value,
+            "uncertainty": cert_u,
+            "start_certificate_id": start_cert_id,
+        }
+        reading_results.append(
+            {
+                "instrument": code,
+                "value": value,
+                "participated": True,
+                "start_certificate_id": start_cert_id,
+                "uncertainty": cert_u,
+                "unit": cert_unit,
+                "nonparticipation_reason_code": None,
+                "nonparticipation_reason": None,
+            }
+        )
+
+    ordered = sorted(participants)
+    n = len(ordered)
+
+    # 两两 En
+    pairs: list[dict[str, Any]] = []
+    adj: dict[str, set[str]] = {code: set() for code in ordered}
+    compatible_count = 0
+    for a in range(n):
+        ci = ordered[a]
+        ri = participants[ci]
+        for b in range(a + 1, n):
+            cj = ordered[b]
+            rj = participants[cj]
+            dx = abs(ri["value"] - rj["value"])
+            ui, uj = ri["uncertainty"], rj["uncertainty"]
+            denom = math.sqrt(ui * ui + uj * uj)
+            if denom == 0.0:
+                en_value: Optional[float] = None
+                equal = dx == 0.0
+                compatible = equal
+                decision = (
+                    _DECISION_ZERO_EQUAL if equal else _DECISION_ZERO_UNEQUAL
+                )
+            else:
+                en_value = dx / denom
+                compatible = en_value <= _EN_THRESHOLD
+                decision = (
+                    _DECISION_COMPATIBLE if compatible else _DECISION_INCOMPATIBLE
+                )
+            pairs.append(
+                {
+                    "instrument_i": ci,
+                    "instrument_j": cj,
+                    "value_i": ri["value"],
+                    "value_j": rj["value"],
+                    "uncertainty_i": ui,
+                    "uncertainty_j": uj,
+                    "en": en_value,
+                    "compatible": compatible,
+                    "decision": decision,
+                }
+            )
+            if compatible:
+                compatible_count += 1
+                adj[ci].add(cj)
+                adj[cj].add(ci)
+
+    # 极大两两相容分组（极大团）；只保留人数至少为 2 的分组
+    clique_tuples = maximal_cliques(adj) if n >= 2 else []
+    groups: list[dict[str, Any]] = []
+    for members in clique_tuples:
+        if len(members) < 2:
+            continue
+        group_index = len(groups) + 1
+        groups.append(
+            {
+                "group_index": group_index,
+                "size": len(members),
+                "instruments": list(members),
+                "members": [
+                    {
+                        "group_index": group_index,
+                        "instrument": code,
+                        "value": participants[code]["value"],
+                        "uncertainty": participants[code]["uncertainty"],
+                    }
+                    for code in members
+                ],
+            }
+        )
+
+    reason_code: Optional[str] = None
+    reason: Optional[str] = None
+    if n < 2:
+        reason_code = REASON_INSUFFICIENT_COMPATIBLE_READINGS
+        reason = (
+            f"仅有 {n} 条读数具备唯一且校验通过、单位与目标单位一致的溯源链，"
+            "相容性评估至少需要 2 条可参与读数"
+        )
+
+    return {
+        "at": at_s,
+        "dry_run": True,
+        "target_unit": target_unit,
+        "readings": reading_results,
+        "requested_reading_count": len(readings),
+        "participant_count": n,
+        "nonparticipant_count": len(nonparticipants),
+        "participants": ordered,
+        "nonparticipants": nonparticipants,
+        "pair_count": len(pairs),
+        "pairs": pairs,
+        "compatible_pair_count": compatible_count,
+        "incompatible_pair_count": len(pairs) - compatible_count,
+        "group_count": len(groups),
+        "groups": groups,
+        "reason_code": reason_code,
+        "reason": reason,
+        "statistics": {
+            "instruments_total": len(cat.instruments),
+            "certificates_total": len(cat.certs),
+            "edges_total": len(cat.edges),
+            "requested_reading_count": len(readings),
+            "participant_count": n,
+            "nonparticipant_count": len(nonparticipants),
+            "pair_count": len(pairs),
+            "compatible_pair_count": compatible_count,
+            "incompatible_pair_count": len(pairs) - compatible_count,
+            "maximal_compatible_group_count": len(groups),
         },
     }
 

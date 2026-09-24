@@ -1,11 +1,14 @@
 """计量校准溯源 API 入口。"""
 from __future__ import annotations
 
+import math
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .database import get_conn_ctx, init_db
 from .routers import (
@@ -49,6 +52,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.exception_handler(RequestValidationError)
+async def _sanitizing_validation_handler(
+    request: Request, exc: RequestValidationError
+):
+    """422 校验错误处理器。
+
+    默认处理器会把请求中的原始输入原样回显；当输入含 NaN/Infinity 等
+    非有限浮点（如相容性评估的测量值）时，回显体会违反 JSON 规范并在
+    响应序列化阶段二次失败。这里把非有限值替换为字符串占位，保证
+    客户端始终拿到结构化 422 而非 500。
+    """
+
+    def _sanitize(value):
+        if isinstance(value, float) and not math.isfinite(value):
+            return str(value)
+        if isinstance(value, BaseException):
+            return str(value)
+        if isinstance(value, dict):
+            return {k: _sanitize(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_sanitize(v) for v in value]
+        return value
+
+    return JSONResponse(
+        status_code=422,
+        content={"detail": [_sanitize(e) for e in exc.errors()]},
+    )
+
 app.include_router(instruments.router)
 app.include_router(certificates.router)
 app.include_router(edges.router)
@@ -83,6 +115,10 @@ def root():
             "batch_common_traceability": (
                 "POST /api/assessments/common-traceability"
                 "（多仪器共同溯源核查，只读，不写库）"
+            ),
+            "batch_measurement_compatibility": (
+                "POST /api/assessments/measurement-compatibility"
+                "（多仪器测量值 En 两两相容性 + 极大相容分组，只读，不写库）"
             ),
             "calibration_slot_query": (
                 "GET /api/calibration-slots?instrument=&start=&end=&duration_seconds="

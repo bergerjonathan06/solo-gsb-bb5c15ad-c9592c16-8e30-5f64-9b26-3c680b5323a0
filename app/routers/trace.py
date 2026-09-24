@@ -9,6 +9,7 @@ from ..database import get_db
 from ..engine import (
     assess_deactivation,
     build_common_trace_report,
+    build_measurement_compatibility_report,
     build_report,
     build_window_report,
 )
@@ -18,6 +19,8 @@ from ..schemas import (
     CoverageWindowReport,
     DeactivationImpactReport,
     DeactivationIn,
+    MeasurementCompatibilityIn,
+    MeasurementCompatibilityReport,
     TraceReport,
 )
 
@@ -138,3 +141,34 @@ def common_traceability(body: CommonTraceIn, db: Connection = Depends(get_db)):
     返回“无共同证书”。整个过程只读数据库，响应恒带 ``dry_run: true``。
     """
     return build_common_trace_report(db, body.at, body.instrument_codes)
+
+
+@router.post(
+    "/assessments/measurement-compatibility",
+    response_model=MeasurementCompatibilityReport,
+    tags=["measurement-compatibility"],
+)
+def measurement_compatibility(
+    body: MeasurementCompatibilityIn, db: Connection = Depends(get_db)
+):
+    """批次测量值相容性评估（只读，不写入业务数据）。
+
+    输入 UTC 评估时点、目标单位及 2～12 条**仪器编码互异**的有限测量
+    值读数。服务端逐条复用现有单仪器链路报告：仅以该时点**唯一且校验
+    通过**（resolution=unique 且零 ERROR）且**起点证书不确定度单位与
+    目标单位一致**的读数参与计算；链不可用（仪器不存在 / 无有效证书 /
+    起点不唯一 / 多候选链 / 链断裂 / 校验失败）或单位不符的读数逐条
+    返回原因，**多候选链绝不任意选取一条**。
+
+    对可参与读数两两计算归一化偏差
+    ``En = |x_i - x_j| / sqrt(U_i² + U_j²)``，其中 U 取各仪器起点证书
+    的扩展不确定度：``En <= 1`` 判为相容；两个 U 均为 0 时分母为零，
+    仅当测量值相等才相容。响应给出每对读数的 En 与判定，以及所有
+    “人数至少为 2”的**极大两两相容分组**（极大团枚举，分组可重叠，
+    按仪器编码稳定排序，不用连通分量代替）。整个过程只读数据库，
+    响应恒带 ``dry_run: true``。
+    """
+    readings = [(r.instrument_code, r.value) for r in body.readings]
+    return build_measurement_compatibility_report(
+        db, body.at, body.target_unit, readings
+    )

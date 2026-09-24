@@ -59,7 +59,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（79 个用例）
+pytest -q        # 运行测试（95 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -126,6 +126,7 @@ calibration_bookings（校准工位预约；全实验室单个工位，半开区
 | **GET** | **`/api/export/{instrument}?at=`** | **JSON 导出（attachment 下载）** |
 | **POST** | **`/api/assessments/certificate-deactivation`** | **证书停用影响评估（dry-run，不写库）** |
 | **POST** | **`/api/assessments/common-traceability`** | **批次共同溯源核查：多仪器唯一有效链求最近共同证书（只读，不写库）** |
+| **POST** | **`/api/assessments/measurement-compatibility`** | **批次测量值相容性评估：两两 En 判定 + 极大两两相容分组（只读，不写库）** |
 | POST | `/api/admin/reset` | 清空全部数据（演示/测试用） |
 
 ### 1）批量提交
@@ -740,6 +741,152 @@ curl -X POST http://localhost:8000/api/assessments/common-traceability \
 请求中仪器少于 2 台、编码重复或含空白字符串时返回 **422**（中文原因）；
 时间入参按 UTC 解释，建议统一用 `...Z` 格式，留空取服务端当前时间。
 
+### 7）批次测量值相容性评估（POST /api/assessments/measurement-compatibility）
+
+需要判断**多台仪器在同一 UTC 时点的测量值是否彼此相容**（如比对实验、
+期间核查）时，提交 UTC 评估时点、**目标单位**及 **2～12 条仪器编码互异**
+的有限测量值。服务端对每条读数**复用现有单仪器链路报告**（`/api/reports`
+同一引擎）：
+
+- 仅当该仪器在该时点的报告为“唯一成链”（`resolution=unique`）**且零
+  ERROR**，并且**唯一有效链起点证书登记的不确定度单位与目标单位一致**
+  （逐字符比较，不做单位换算）时，该读数才参与计算，其扩展不确定度 U
+  取自该起点证书；
+- 链不可用（仪器不存在 / 无有效证书 / 起点证书不唯一 / **多条候选链** /
+  链断裂 / 唯一链未通过校验）或**证书单位与目标单位不符**的读数，在
+  `nonparticipants` 中**逐条返回原因**，不参与两两计算；**多候选链绝不
+  任意选取一条**。
+
+对全部可参与读数**两两**计算归一化偏差（En 数）：
+
+```
+En = |x_i − x_j| / sqrt(U_i² + U_j²)
+```
+
+`En ≤ 1` 判为**相容**；两个 U **均为 0** 时分母为零（`en=null`），
+此时**仅当两个测量值相等才相容**。响应给出每一对读数的 En 与判定，
+以及所有**人数至少为 2 的极大两两相容分组**（极大团 / maximal cliques，
+Bron–Kerbosch 枚举）：
+
+- 分组可**重叠**（同一仪器可属于多个极大相容组），但绝不返回人数 <2 的组；
+- 分组按“组内仪器编码排序后的元组”字典序**稳定排序**，组内仪器编码同样
+  字典序升序；
+- **不用连通分量代替**：如相容关系图为路径 `W—W2—W3`（W 与 W3 不相容），
+  返回两个极大团 `[W, W2]`、`[W2, W3]`，而不是把三人并入同一组。
+
+```bash
+curl -X POST http://localhost:8000/api/assessments/measurement-compatibility \
+  -H 'Content-Type: application/json' -d '{
+  "at": "2026-06-15T00:00:00Z",
+  "target_unit": "mm",
+  "readings": [
+    {"instrument_code": "INST-W1", "value": 25.000},
+    {"instrument_code": "INST-W2", "value": 25.002},
+    {"instrument_code": "INST-P1", "value": 100.0},
+    {"instrument_code": "INST-T1", "value": 50.0}
+  ]
+}'
+```
+
+```jsonc
+{
+  "at": "2026-06-15T00:00:00Z",
+  "dry_run": true,                       // 恒为 true：只读评估，不写库
+  "target_unit": "mm",
+  "requested_reading_count": 4,
+  "participant_count": 2,
+  "nonparticipant_count": 2,
+  "participants": ["INST-W1", "INST-W2"],   // 字典序稳定排序
+  "nonparticipants": [
+    {
+      "instrument": "INST-P1", "value": 100.0,
+      "reason_code": "MULTIPLE_VALID_CHAINS",   // 多候选：不任取一条
+      "reason": "…链不唯一，不得任意选取一条…",
+      "resolution": "ambiguous", "valid": false,
+      "start_certificate_id": null, "certificate_unit": null,
+      "uncertainty": null, "conflicts": [ /* 与 /api/reports 同构 */ ],
+      "error_count": 1, "warning_count": 0
+    },
+    {
+      "instrument": "INST-T1", "value": 50.0,
+      "reason_code": "CHAIN_BROKEN", "resolution": "broken", "valid": false
+      // …start_certificate_id/certificate_unit/uncertainty 均为 null
+    }
+  ],
+  "readings": [                          // 逐条结果，按请求中的读数顺序
+    {"instrument": "INST-W1", "value": 25.0, "participated": true,
+     "start_certificate_id": "CW1-1", "uncertainty": 0.002, "unit": "mm",
+     "nonparticipation_reason_code": null, "nonparticipation_reason": null},
+    {"instrument": "INST-W2", "value": 25.002, "participated": true,
+     "start_certificate_id": "CW2-1", "uncertainty": 0.003, "unit": "mm",
+     "nonparticipation_reason_code": null, "nonparticipation_reason": null}
+    // INST-P1 / INST-T1：participated=false 并附原因
+  ],
+  "pair_count": 1,
+  "pairs": [
+    {
+      "instrument_i": "INST-W1", "instrument_j": "INST-W2",
+      "value_i": 25.0, "value_j": 25.002,
+      "uncertainty_i": 0.002, "uncertainty_j": 0.003,
+      "en": 0.5547001962249216,             // =0.002/sqrt(0.002²+0.003²)
+      "compatible": true,                  // En<=1
+      "decision": "COMPATIBLE"
+    }
+  ],
+  "compatible_pair_count": 1,
+  "incompatible_pair_count": 0,
+  "group_count": 1,
+  "groups": [
+    {
+      "group_index": 1, "size": 2,
+      "instruments": ["INST-W1", "INST-W2"],
+      "members": [
+        {"group_index": 1, "instrument": "INST-W1",
+         "value": 25.0, "uncertainty": 0.002},
+        {"group_index": 1, "instrument": "INST-W2",
+         "value": 25.002, "uncertainty": 0.003}
+      ]
+    }
+  ],
+  "reason_code": null,                     // 可参与读数不足 2 个时为 INSUFFICIENT_PARTICIPANTS
+  "reason": null,
+  "statistics": {"requested_reading_count": 4, "participant_count": 2,
+                 "nonparticipant_count": 2, "pair_count": 1,
+                 "compatible_pair_count": 1, "incompatible_pair_count": 0,
+                 "maximal_compatible_group_count": 1, ...}
+}
+```
+
+每对结果的 `decision` 取值：
+
+| decision | 含义 |
+| --- | --- |
+| `COMPATIBLE` | `En ≤ 1`（分母非零），相容 |
+| `INCOMPATIBLE` | `En > 1`（分母非零），不相容 |
+| `BOTH_UNCERTAINTY_ZERO_EQUAL` | 两 U 均为 0（`en=null`）且测量值相等，相容 |
+| `BOTH_UNCERTAINTY_ZERO_UNEQUAL` | 两 U 均为 0（`en=null`）且测量值不等，不相容 |
+
+不可参与读数原因码（`nonparticipants[].reason_code`）：
+
+| code | 含义 |
+| --- | --- |
+| `INSTRUMENT_NOT_FOUND` | 仪器编码不存在于库中 |
+| `NO_ACTIVE_CERTIFICATE` | 评估时点无处于有效区间的证书，链无法开始 |
+| `MULTIPLE_ACTIVE_CERTIFICATES` | 评估时点多张证书有效，起点不唯一 |
+| `MULTIPLE_VALID_CHAINS` | 存在 ≥2 条到基准且校验通过的候选链，**不任取一条** |
+| `CHAIN_BROKEN` | 全部候选分支到基准前终止（死路/断档/环） |
+| `ALL_CHAINS_FAILED_CHECKS` | 有到基准的候选链，但均未通过校验 |
+| `CHAIN_VALIDATION_FAILED` | 唯一成链但链上存在 ERROR |
+| `CERTIFICATE_UNIT_MISMATCH` | 起点证书不确定度单位与 `target_unit` 不符（附 `certificate_unit`/`uncertainty`，不做单位换算） |
+
+顶层 `reason_code`：可参与读数不足 2 个时为 `INSUFFICIENT_PARTICIPANTS`
+（此时 `pairs` / `groups` 为空数组）；正常完成时为 `null`（即使各读数两两
+不相容、没有任何 ≥2 人相容组，只要可参与读数 ≥2 个也属正常完成）。
+请求读数少于 2 条、超过 12 条、仪器编码重复/空白、目标单位空白，或测量值
+不是有限数值（NaN / Infinity）时返回 **422**（中文原因）。时间入参按 UTC
+解释，建议统一用 `...Z` 格式，留空取服务端当前时间。响应恒带
+`"dry_run": true`——**只读计算，不写入任何业务数据**。
+
 ---
 
 ## 六、内置演示场景
@@ -816,6 +963,31 @@ curl -X POST http://localhost:8000/api/assessments/common-traceability \
 #   INST-B1 -> ALL_CHAINS_FAILED_CHECKS
 ```
 
+批次测量值相容性评估示例：`INST-W1`（起点证书 U=0.002 mm）与 `INST-W2`
+（U=0.003 mm）读数相差 0.002 mm，`En≈0.555≤1` 相容并归入同一个极大两两
+相容分组；同次提交中 `INST-P1`（多候选）与 `INST-T1`（断档）逐条返回
+不可参与原因，不参与计算：
+
+```bash
+curl -X POST http://localhost:8000/api/assessments/measurement-compatibility \
+  -H 'Content-Type: application/json' -d '{
+  "at": "2026-06-15T00:00:00Z",
+  "target_unit": "mm",
+  "readings": [
+    {"instrument_code": "INST-W1", "value": 25.000},
+    {"instrument_code": "INST-W2", "value": 25.002},
+    {"instrument_code": "INST-P1", "value": 100.0},
+    {"instrument_code": "INST-T1", "value": 50.0}
+  ]
+}'
+# participants=["INST-W1","INST-W2"]
+# pairs[0].en≈0.5547, compatible=true, decision="COMPATIBLE"
+# groups=[{"size":2, "instruments":["INST-W1","INST-W2"], ...}]
+# nonparticipants:
+#   INST-P1 -> MULTIPLE_VALID_CHAINS（绝不任取一条链）
+#   INST-T1 -> CHAIN_BROKEN
+```
+
 校准工位预约示例（单工位、半开占用、起点证书截止）：
 
 ```bash
@@ -882,6 +1054,16 @@ curl "http://localhost:8000/api/calibration-bookings?instrument=INST-W1"
    POST 在 `BEGIN IMMEDIATE` 同一写事务内重查仪器、溯源链、证书截止与
    半开占用，任一不满足即 409 回滚，全部满足才原子写入；因此并发确认
    同一时段恰有一个成功，不产生重叠预约。
+10. 批次测量值相容性评估：对每条读数提交的仪器在同一时点各跑一次步骤
+    1~5（只读），仅收集“唯一成链且零 ERROR”且**起点证书不确定度单位
+    与目标单位逐字符一致**的读数，其扩展不确定度 U 取自起点证书；其余
+    读数逐条记录不可参与原因（链不可用 / `CERTIFICATE_UNIT_MISMATCH`，
+    多候选绝不任取一条）。对可参与读数两两计算
+    `En=|x_i-x_j|/sqrt(U_i²+U_j²)`，`En≤1` 判为相容；两 U 均为 0 时
+    En 不可计算，仅测量值相等才相容。以仪器为节点、两两相容为边建图，
+    用 Bron–Kerbosch（pivot 剪枝）枚举全部极大团并按仪器编码元组稳定
+    排序，只返回人数至少为 2 的极大两两相容分组——分组可重叠，不用
+    连通分量代替。全程不写入业务数据。
 
 ## 八、项目结构
 
@@ -894,13 +1076,15 @@ app/
   engine.py          溯源链重建（DFS）、校验规则、停用影响模拟（内存 Catalog）、
                      仪器时间窗覆盖分段（边界点 + 开区间内部采样）、
                      批次共同溯源核查（共同证书选举 + 子链截取）、
+                     批次测量值相容性评估（两两 En + Bron–Kerbosch 极大相容团）、
                      unique_chain_gate（唯一有效链门禁，工位预约复用）
   booking.py         校准工位预约：单工位半开占用查询、最早空档贪心、
                      写事务内重查确认（409 冲突）与预约持久化/列表
   seed.py            五场景演示数据 + 1 条校准工位演示预约
   routers/           instruments / certificates / edges /
                      submissions（批量提交 + preflight 预检）/
-                     trace(report + 时间窗覆盖 + 停用影响评估 + 批次共同溯源核查) /
+                     trace(report + 时间窗覆盖 + 停用影响评估 + 批次共同溯源核查
+                           + 批次测量值相容性评估) /
                      calibration（工位空档 GET + 预约确认 POST + 预约列表 GET）/
                      export / admin
 tests/test_trace.py          10 个接口级测试
@@ -908,6 +1092,7 @@ tests/test_preflight.py      11 个批量提交预检测试
 tests/test_deactivation.py   8 个停用影响评估测试
 tests/test_coverage.py       10 个仪器时间窗覆盖查询测试
 tests/test_common_trace.py   12 个批次共同溯源核查测试
+tests/test_measurement_compatibility.py  16 个批次测量值相容性评估测试
 tests/test_calibration.py    28 个校准工位预约测试
 Dockerfile · docker-compose.yml · requirements.txt
 ```

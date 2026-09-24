@@ -1,10 +1,11 @@
 """请求/响应 Pydantic 模型。时间均按 UTC 解释。"""
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .utils import SUPPORTED_ALGS, compute_digest, fmt
 
@@ -160,6 +161,62 @@ class CommonTraceIn(BaseModel):
             dup = sorted({c for c in codes if codes.count(c) > 1})
             raise ValueError(f"仪器编码不得重复: {dup}")
         return codes
+
+
+class MeasurementReadingIn(BaseModel):
+    """一条仪器测量读数：互异仪器编码 + 有限测量值（以目标单位计）。"""
+
+    instrument_code: str = Field(..., description="测量所用仪器编码")
+    value: float = Field(
+        ..., description="该仪器在评估时点的有限测量值（以 target_unit 计）"
+    )
+
+    @field_validator("instrument_code")
+    @classmethod
+    def _check_instrument_code(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("仪器编码不能为空字符串")
+        return v.strip()
+
+    @field_validator("value")
+    @classmethod
+    def _check_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("测量值必须为有限数值（不接受 NaN/Infinity/-Infinity）")
+        return v
+
+
+class MeasurementCompatibilityIn(BaseModel):
+    """批次测量值相容性评估请求（只读，不写入数据库）。"""
+
+    at: Optional[datetime] = Field(
+        None, description="UTC 评估时点；留空取服务端当前时间"
+    )
+    target_unit: str = Field(
+        ..., min_length=1, description="目标测量单位（如 mm / kPa），需与起点证书单位一致"
+    )
+    readings: List[MeasurementReadingIn] = Field(
+        ...,
+        min_length=2,
+        max_length=12,
+        description="2～12 条测量读数，仪器编码必须互不相同",
+    )
+
+    @field_validator("target_unit")
+    @classmethod
+    def _check_target_unit(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("目标单位不能为空字符串")
+        return v.strip()
+
+    @model_validator(mode="after")
+    def _check_distinct_instruments(self):
+        codes = [r.instrument_code.strip() for r in self.readings]
+        distinct = list(dict.fromkeys(codes))
+        if len(distinct) != len(codes):
+            dup = sorted({c for c in codes if codes.count(c) > 1})
+            raise ValueError(f"读数中的仪器编码不得重复: {dup}")
+        return self
 
 
 # ---------- 输出 ----------
@@ -673,3 +730,160 @@ class CalibrationSlotsOut(BaseModel):
     trace_report: dict = Field(
         ..., description="查询起点该仪器的完整溯源校验报告（结构同 /api/reports）"
     )
+
+
+# ---------- 批次测量值相容性评估输出 ----------
+
+class MeasurementNonparticipant(BaseModel):
+    """一条不可参与相容性计算的读数及其原因。"""
+
+    instrument: str = Field(..., description="读数提交的仪器编码")
+    value: Optional[float] = Field(
+        None, description="该读数的测量值（以 target_unit 计）"
+    )
+    reason_code: str = Field(
+        ...,
+        description=(
+            "不可参与原因码：INSTRUMENT_NOT_FOUND | NO_ACTIVE_CERTIFICATE | "
+            "MULTIPLE_ACTIVE_CERTIFICATES | MULTIPLE_VALID_CHAINS | "
+            "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED | "
+            "CERTIFICATE_UNIT_MISMATCH"
+        ),
+    )
+    reason: str = Field(..., description="中文原因说明")
+    resolution: Optional[str] = Field(
+        None, description="该时点单仪器报告的 resolution（仪器不存在时为 null）"
+    )
+    valid: bool
+    start_certificate_id: Optional[str] = Field(
+        None, description="该仪器唯一有效链的起点证书 id（链不可用时为 null）"
+    )
+    certificate_unit: Optional[str] = Field(
+        None, description="起点证书登记的不确定度单位（单位不符时给出，否则为 null）"
+    )
+    uncertainty: Optional[float] = Field(
+        None, description="起点证书的扩展不确定度（不参与计算时为 null）"
+    )
+    conflicts: List[Conflict] = Field(
+        default_factory=list,
+        description="该时点单仪器报告的完整可解释冲突明细（结构同 /api/reports）",
+    )
+    error_count: Optional[int] = None
+    warning_count: Optional[int] = None
+
+
+class MeasurementReadingResult(BaseModel):
+    """单条读数的参与结果（按请求中的读数顺序排列）。"""
+
+    instrument: str
+    value: float = Field(..., description="测量值（以 target_unit 计）")
+    participated: bool = Field(
+        ..., description="该读数是否以唯一且校验通过、单位一致的溯源链参与计算"
+    )
+    start_certificate_id: Optional[str] = Field(
+        None, description="该仪器在评估时点唯一有效链的起点证书 id"
+    )
+    uncertainty: Optional[float] = Field(
+        None, description="起点证书的扩展不确定度（不参与计算时为 null）"
+    )
+    unit: Optional[str] = Field(
+        None, description="起点证书登记的不确定度单位（不参与计算时为 null）"
+    )
+    nonparticipation_reason_code: Optional[str] = None
+    nonparticipation_reason: Optional[str] = None
+
+
+class CompatibilityPair(BaseModel):
+    """一对参与读数的 En 计算结果（仪器编码字典序升序，两两一组）。"""
+
+    instrument_i: str
+    instrument_j: str
+    value_i: float = Field(..., description="仪器 i 的测量值（以 target_unit 计）")
+    value_j: float = Field(..., description="仪器 j 的测量值（以 target_unit 计）")
+    uncertainty_i: float = Field(..., description="仪器 i 起点证书扩展不确定度 U_i")
+    uncertainty_j: float = Field(..., description="仪器 j 起点证书扩展不确定度 U_j")
+    en: Optional[float] = Field(
+        None,
+        description=(
+            "归一化偏差 En=|x_i-x_j|/sqrt(U_i²+U_j²)；"
+            "两 U 均为 0 时分母为 0，无法计算，返回 null"
+        ),
+    )
+    compatible: bool = Field(
+        ..., description="En<=1 判为相容；两 U 均为 0 时仅测量值相等才相容"
+    )
+    decision: str = Field(
+        ...,
+        description=(
+            "判定中文描述：COMPATIBLE | INCOMPATIBLE | "
+            "BOTH_UNCERTAINTY_ZERO_EQUAL | BOTH_UNCERTAINTY_ZERO_UNEQUAL"
+        ),
+    )
+
+
+class CompatibilityGroupMember(BaseModel):
+    group_index: int = Field(
+        ..., description="所在相容分组的 1 基序号（与 groups 下标对应）"
+    )
+    instrument: str
+    value: float
+    uncertainty: float
+
+
+class CompatibilityGroup(BaseModel):
+    """一个人数至少为 2 的极大两两相容分组（极大团）。"""
+
+    group_index: int = Field(..., description="分组序号（从 1 开始）")
+    size: int = Field(..., description="分组人数（至少为 2）")
+    instruments: List[str] = Field(
+        ...,
+        description="组内仪器编码（字典序升序）；分组可重叠，组间为极大团而非连通分量",
+    )
+    members: List[CompatibilityGroupMember] = Field(
+        ..., description="组内各仪器的读数与不确定度（与 instruments 同序）"
+    )
+
+
+class MeasurementCompatibilityReport(BaseModel):
+    at: datetime
+    dry_run: bool = Field(
+        ..., description="恒为 true：相容性评估为只读计算，不写入业务数据"
+    )
+    target_unit: str = Field(..., description="请求的目标单位")
+    readings: List[MeasurementReadingResult] = Field(
+        ..., description="逐条读数的参与结果（按请求顺序）"
+    )
+    requested_reading_count: int
+    participant_count: int
+    nonparticipant_count: int
+    participants: List[str] = Field(
+        default_factory=list,
+        description="实际参与计算的仪器编码（字典序升序）",
+    )
+    nonparticipants: List[MeasurementNonparticipant] = Field(
+        default_factory=list,
+        description="逐条返回的不可参与读数及原因（按请求中的读数顺序）",
+    )
+    pair_count: int = Field(..., description="参与读数两两组合数 C(n,2)")
+    pairs: List[CompatibilityPair] = Field(
+        default_factory=list,
+        description="全部两两 En 结果（仪器编码按字典序稳定排序）",
+    )
+    compatible_pair_count: int
+    incompatible_pair_count: int
+    group_count: int
+    groups: List[CompatibilityGroup] = Field(
+        default_factory=list,
+        description=(
+            "人数至少为 2 的全部极大两两相容分组（Bron–Kerbosch 极大团枚举，"
+            "非连通分量），按组内仪器编码元组字典序稳定排序"
+        ),
+    )
+    reason_code: Optional[str] = Field(
+        None,
+        description=(
+            "可参与读数不足 2 个时为 INSUFFICIENT_PARTICIPANTS；正常完成时为 null"
+        ),
+    )
+    reason: Optional[str] = Field(None, description="中文原因说明")
+    statistics: dict = Field(default_factory=dict)
